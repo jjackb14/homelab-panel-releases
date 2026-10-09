@@ -50,7 +50,7 @@ set -Eeuo pipefail
 # Which release this script belongs to. Each release's copy of this script has its own version
 # written here, so it always downloads the files of that same release and never mixes versions.
 # A copy that still says "dev" did not come from a release, and refuses to run.
-VERSION=${VERSION:-v0.1.0}
+VERSION=${VERSION:-v0.1.1}
 REPO=jjackb14/homelab-panel-releases
 RELEASE_BASE=https://github.com/$REPO/releases/download/$VERSION
 # The panel itself: one program file, built for 64-bit Intel/AMD Linux.
@@ -415,6 +415,10 @@ preflight() {
   if ! command -v pct >/dev/null || ! command -v pveum >/dev/null; then
     die "pct/pveum not found: is this a Proxmox node?"
   fi
+  # The panel is built for 64-bit Intel/AMD processors only.
+  local arch
+  arch=$(dpkg --print-architecture)
+  [ "$arch" = amd64 ] || die "homelab-panel runs on x86 (amd64) nodes only, and this node is $arch"
   if [ "$NONINTERACTIVE" = 1 ] && [ ! -s "$var_password_file" ]; then
     die "NONINTERACTIVE=1 needs var_password_file: a file holding the panel's sign-in password"
   fi
@@ -428,14 +432,28 @@ preflight() {
   if pveum user token list panel@pve --output-format json 2>/dev/null | grep -q '"tokenid":"panel"'; then
     die "panel@pve already has an API token named \"panel\", from an earlier install. If that install is gone, remove it with: pveum user token remove panel@pve panel"
   fi
-  # The container gets its DNS server set explicitly. Left alone, a new container copies the
-  # node's settings, and if the node runs Tailscale that can be Tailscale's own 100.100.100.100,
-  # which doesn't work inside the container and makes package downloads fail. So the script
-  # uses the node's first other DNS server, or 1.1.1.1 if there is none.
-  if [ -z "$var_ns" ]; then
-    var_ns=$(awk '$1 == "nameserver" && $2 != "100.100.100.100" { print $2; exit }' /etc/resolv.conf 2>/dev/null || true)
-  fi
-  var_ns=${var_ns:-1.1.1.1}
+  [ -n "$var_ns" ] || var_ns=$(pick_nameserver)
+}
+
+# The container gets its DNS server set explicitly. Left alone, a new container copies the
+# node's DNS settings, and if the node runs Tailscale those are Tailscale's own servers
+# (100.100.100.100 and fd7a:115c:a1e0::53). They only work on a machine that is itself on the
+# tailnet, so the container couldn't download anything. This picks the node's first DNS server
+# that isn't Tailscale's, and an IPv4 one, since the container gets an IPv4 address. If the
+# node's settings are all Tailscale's, it uses the ones Tailscale saved when it took over
+# (resolv.pre-tailscale-backup.conf), and if there are none of those either, 1.1.1.1.
+RESOLV_FILES=${RESOLV_FILES:-/etc/resolv.conf /etc/resolv.pre-tailscale-backup.conf}
+pick_nameserver() {
+  local f ns
+  for f in $RESOLV_FILES; do
+    [ -f "$f" ] || continue
+    ns=$(awk '$1 == "nameserver" && $2 ~ /^[0-9.]+$/ && $2 != "100.100.100.100" { print $2; exit }' "$f")
+    if [ -n "$ns" ]; then
+      printf '%s' "$ns"
+      return
+    fi
+  done
+  printf '1.1.1.1'
 }
 
 # Picks a Proxmox storage that can hold either container disks ("rootdir") or templates
@@ -508,9 +526,14 @@ create_ct() {
   msg_info "Downloading the Debian 13 template"
   run pveam update
   local tmpl
-  tmpl=$(pveam available --section system | awk '$2 ~ /^debian-13-standard_/ { print $2 }' | sort -V | tail -n1)
-  [ -n "$tmpl" ] || die "no debian-13-standard template in pveam available"
-  pveam list "$var_template_storage" | grep -q "$tmpl" || run pveam download "$var_template_storage" "$tmpl"
+  # The newest Debian 13 template for x86 (amd64). Proxmox also offers ARM (arm64) ones, which
+  # can't run on these nodes.
+  tmpl=$(pveam available --section system | awk '$2 ~ /^debian-13-standard_.*_amd64\.tar/ { print $2 }' | sort -V | tail -n1)
+  [ -n "$tmpl" ] || die "no Debian 13 template for amd64 in pveam available"
+  if ! pveam list "$var_template_storage" | grep -q "$tmpl"; then
+    run pveam download "$var_template_storage" "$tmpl"
+    CREATED+=("pveam remove $var_template_storage:vztmpl/$tmpl")
+  fi
   msg_ok "Debian 13 template ready"
 
   msg_info "Creating LXC Container"
