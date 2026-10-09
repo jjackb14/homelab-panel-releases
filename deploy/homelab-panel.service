@@ -1,0 +1,57 @@
+# homelab-panel as a system service
+#
+# This file tells systemd (the program that starts and supervises services on Linux) how to
+# run the panel: start it when the container boots, run it as its own unprivileged user,
+# restart it if it crashes, and fence it off from the rest of the system.
+#
+# The installer puts it at /etc/systemd/system/homelab-panel.service. Useful commands, run
+# inside the container:
+#
+#   systemctl status homelab-panel      is it running?
+#   systemctl restart homelab-panel     restart it (after changing /etc/homelab-panel/.env)
+#   journalctl -u homelab-panel -f      follow its log
+
+[Unit]
+Description=homelab-panel (Proxmox updates and file manager)
+Documentation=https://github.com/jjackb14/homelab-panel-releases
+# Start only once the network is up: the panel's first job is to reach the Proxmox API.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# The panel runs as its own user, never as root. It doesn't need root inside the container:
+# everything it changes on your cluster goes out over SSH to the nodes.
+User=homelab-panel
+Group=homelab-panel
+ExecStart=/opt/homelab-panel/homelab-panel
+# The settings file (see panel.env.example). systemd reads it and hands the settings to the
+# panel when it starts.
+EnvironmentFile=/etc/homelab-panel/.env
+# The panel's data directory: its database and job logs. It is also the panel user's home
+# folder, where SSH keeps its list of known node keys.
+WorkingDirectory=/var/lib/homelab-panel
+# If the panel ever crashes, systemd starts it again after 5 seconds.
+Restart=on-failure
+RestartSec=5
+
+# --- Fencing the panel off ------------------------------------------------------------------
+# These lines limit what the panel could do even if something went wrong with it. It can write
+# to its own data directory and nowhere else. It can't gain extra privileges, see other users'
+# home folders, load kernel modules, or change kernel settings. (The installer creates the
+# container with "nesting" turned on, which these protections need inside a container.)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/homelab-panel
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+# Start the panel whenever the container boots normally.
+WantedBy=multi-user.target
